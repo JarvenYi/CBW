@@ -11,6 +11,7 @@ import os
 import datetime
 import numpy as np
 from sklearn.externals import joblib
+import sklearn
 from tqdm import tqdm
 from utils import grouper, sliding_window, count_sliding_window,\
                   camel_to_snake
@@ -28,7 +29,7 @@ def get_model(name, **kwargs):
         criterion: PyTorch loss Function
         kwargs: hyperparameters with sane defaults
     """
-    device = kwargs.setdefault('device', torch.device('cuda'))  # 给字典添加键值
+    device = kwargs.setdefault('device', torch.device('cuda'))
     n_classes = kwargs['n_classes']
     n_bands = kwargs['n_bands']
 
@@ -38,13 +39,13 @@ def get_model(name, **kwargs):
     weights = kwargs.setdefault('weights', weights)
 
     if name == 'CBW':
-        patch_size = kwargs.setdefault('patch_size', 5)     # 如果'patch_size'键不存在于字典中，将会添加键并将值设为默认值,5
+        patch_size = kwargs.setdefault('patch_size', 5)
         center_pixel = True
-        model = MODEL(n_bands, n_classes, patch_size=patch_size)   # 模型
+        model = MODEL(n_bands, n_classes, patch_size=patch_size)
         lr = kwargs.setdefault('lr', 0.001)
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=0.0005)   # 优化器
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=0.0005)
         kwargs.setdefault('batch_size', 100)
-        criterion = nn.CrossEntropyLoss(weight=kwargs['weights'])   # loss function     # weight参数分别代表n类的权重
+        criterion = nn.CrossEntropyLoss(weight=kwargs['weights'])   # loss function
 
     else:
         raise KeyError("{} model is unknown.".format(name))
@@ -53,7 +54,7 @@ def get_model(name, **kwargs):
     # model = model.cuda()
     epoch = kwargs.setdefault('epoch', 100)
     kwargs.setdefault('scheduler', optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.1, patience=epoch//4,
-                                                                        verbose=True))    # 学习率调整，该方法提供了一些基于训练过程中的某些测量值对学习率进行动态的下降
+                                                                        verbose=True))
     #kwargs.setdefault('scheduler', None)
     kwargs.setdefault('batch_size', 100)
     kwargs.setdefault('supervision', 'full')
@@ -63,50 +64,40 @@ def get_model(name, **kwargs):
     kwargs['center_pixel'] = center_pixel
     return model, optimizer, criterion, kwargs
 
-def conv3x3(in_planes, out_planes, stride=1, padding=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=padding, bias=False)
-
 class CBW_BasicBlock(nn.Module):
-
-    def __init__(self, in_channels, channels, stride=1, padding=1, patch_size=11):
+    def __init__(self, in_channels, channels, stride=1, padding=1, downsample=None, patch_size=11, count=1):
         super(CBW_BasicBlock, self).__init__()
         self.stride = stride
+        self.count = count
         self.padding = padding
         self.in_channels = in_channels
         self.patch_size = patch_size
-        self.conv1 = nn.Conv2d(in_channels, channels, 3, stride=self.stride, padding=self.padding)
-        self.leaky_relu = nn.LeakyReLU()
-        self.conv2 = nn.Conv2d(channels, channels, 3, 1, 1)
         self.globalAvgPool = nn.AvgPool2d(patch_size, stride=1, padding=0)
-        self.fc = nn.Sequential(
-            nn.Linear(in_features=round(channels), out_features=channels),
-        )
         self.conv1d_1 = nn.Sequential(
-            nn.Conv1d(1, 1, 7, 1, 3),
-            nn.LeakyReLU()
+            nn.Conv1d(1, 1, 7, 1, 3, groups=1, bias=False),
+            nn.BatchNorm1d(1),
+            nn.ReLU()
         )
+        self.conv1d_12 = nn.Sequential(
+            nn.Conv1d(1, 1, 7, 1, 3, groups=1, bias=False),
+            nn.BatchNorm1d(1),
+            nn.ReLU(),
+            )
         self.sigmoid = nn.Sigmoid()
         self.relu_ = nn.ReLU()
+        self.bn = nn.BatchNorm1d(1)
 
     def forward(self, x):
         original_out = x
-        out = self.globalAvgPool(x)     # GlobalAvgPooling
-        out = out.squeeze(3)            # 1DConv
-        out = out.transpose(2, 1)
-        out = self.conv1d_1(out)          # 1DConv2 + FC1
-        out = out.view(out.size(0), -1)  # FC Flattened
-        out = self.fc(out)
-        out = self.sigmoid(out)   # ReLu -> Sigmoid
-        out = out.view(out.size(0), out.size(1), 1, 1)
-        ''' WEP '''
-        weight_max = torch.max(out, dim=1)[0]
-        weight_max = weight_max.unsqueeze(1)
-        weight_min = torch.min(out, dim=1)[0]
-        weight_min = weight_min.unsqueeze(1)
-        out = (out - weight_min) / (weight_max - weight_min)
-
+        out = self.globalAvgPool(x)
+        out = out.squeeze(3)
+        out0 = out.transpose(2, 1)
+        out1 = self.conv1d_1(out0)
+        out2 = self.conv1d_12(out1)
+        out = out1 + out2 + out0
+        out = self.bn(out)
+        out = self.sigmoid(out)
+        out = out.unsqueeze(3).transpose(2, 1)
         out = out * original_out
         return out
 
@@ -114,7 +105,7 @@ class MODEL(nn.Module):
     @staticmethod
     def weight_init(m):
         if isinstance(m, nn.Linear) or isinstance(m, nn.Conv3d):
-            init.kaiming_normal_(m.weight)      # weight kaiming函数初始化
+            init.kaiming_normal_(m.weight)
             init.zeros_(m.bias)
 
     def __init__(self, input_channels, n_classes, patch_size=21):
@@ -124,32 +115,23 @@ class MODEL(nn.Module):
         kernel_size = 3
         nb_filter = 16
 
-        self.abw = nn.Sequential(
-            CBW_BasicBlock(self.input_channels, self.input_channels, stride=1, padding=1, patch_size=patch_size),
+        self.cbw = nn.Sequential(
+            CBW_BasicBlock(self.input_channels, self.input_channels, stride=1, padding=1, patch_size=patch_size, count=1),
         )
         self.conv1 = nn.Sequential(
             nn.Conv2d(self.input_channels, nb_filter*4, kernel_size=1, stride=1, padding=0),
             nn.BatchNorm2d(nb_filter*4),
             nn.LeakyReLU(),
-            nn.Conv2d(nb_filter * 4, nb_filter * 4, kernel_size=1, stride=1, padding=0),
-            nn.BatchNorm2d(nb_filter * 4),
-            nn.LeakyReLU()
         )
         self.maxpool = nn.MaxPool2d((2, 2), 2, 1)
         self.conv2 = nn.Sequential(
             nn.Conv2d(nb_filter*4, nb_filter*8, kernel_size, padding=1),
             nn.BatchNorm2d(nb_filter*8),
-            nn.LeakyReLU(),
-            nn.Conv2d(nb_filter * 8, nb_filter * 8, kernel_size, padding=1),
-            nn.BatchNorm2d(nb_filter * 8),
             nn.LeakyReLU()
         )
         self.conv3 = nn.Sequential(
             nn.Conv2d(nb_filter * 8, nb_filter * 16, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(nb_filter*16),
-            nn.LeakyReLU(),
-            nn.Conv2d(nb_filter * 16, nb_filter * 16, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(nb_filter * 16),
             nn.LeakyReLU()
         )
         self.flattened_size = self.flattened()
@@ -182,7 +164,7 @@ class MODEL(nn.Module):
             return t*w*l*b
 
     def forward(self, x):
-        x = self.abw(x)
+        x = self.cbw(x)
         x = self.conv1(x)
         x = self.maxpool(x)
         x = self.conv2(x)
@@ -218,34 +200,29 @@ def train(net, optimizer, criterion, data_loader, epoch, scheduler=None,
         raise Exception("Missing criterion. You must specify a loss function.")
 
     net.to(device)
-
-    net = nn.DataParallel(net)  # 多GPU运行!!!
-
-    save_epoch = epoch  # // 20 if epoch > 20 else 1
-
+    # net = nn.DataParallel(net)
+    save_epoch = epoch
     losses = np.zeros(1000000)
     mean_losses = np.zeros(100000000)
     iter_ = 1
     loss_win, val_win = None, None
     val_accuracies = []
-
-    for e in tqdm(range(1, epoch + 1), desc="Training the network"):       # tqdm(list)方法可以传入任意一种list   tqdm进展显示
+    for e in tqdm(range(1, epoch + 1), desc="Training the network"):
         # Set the network to training mode
         net.train()
         avg_loss = 0.
-        if e==30:      # lr 衰减
+        if e==30:
             for p in optimizer.param_groups:
                 p['lr'] *= 0.5
-
-        # Run the training loop for one epoch
         for batch_idx, (data, target) in tqdm(enumerate(data_loader), total=len(data_loader)):
             # Load the data into the GPU if required
-            data, target = data.to(device), target.to(device)   # 在DataLoader中已经将Tensor封装成了Variable
+            data, target = data.to(device), target.to(device)
 
             optimizer.zero_grad()
             if supervision == 'full':
                 output = net(data)
                 loss = criterion(output, target)
+
             elif supervision == 'semi':
                 outs = net(data)
                 output, rec = outs
@@ -304,7 +281,7 @@ def train(net, optimizer, criterion, data_loader, epoch, scheduler=None,
             scheduler.step()
 
         # Save the weights
-        if e == 50:
+        if e == 100:
             save_model(net, camel_to_snake(str(net.__class__.__name__)), data_loader.dataset.name, epoch=e, metric=abs(metric))
 
 
@@ -315,8 +292,8 @@ def save_model(model, model_name, dataset_name, **kwargs):
     if isinstance(model, torch.nn.Module):
         filename = str('wk') + "_epoch{epoch}_{metric:.2f}".format(**kwargs)
         tqdm.write("Saving neural network weights in {}".format(filename))
-        # torch.save(model.state_dict(), model_dir + filename + '.pth')   # 这里是仅仅保存学到的参数 但是在直接使用参数时，Acc远没有训练时的高
-        torch.save(model, model_dir + filename + '.pth')  # 这里是保存整个网络的状态
+        # torch.save(model.state_dict(), model_dir + filename + '.pth')
+        torch.save(model, model_dir + filename + '.pth')
     else:
         filename = str('wk')
         tqdm.write("Saving model params in {}".format(filename))
@@ -351,7 +328,6 @@ def test(net, img, hyperparams):
                 data = np.copy(data)
                 data = data.transpose(0, 3, 1, 2)
                 data = torch.from_numpy(data)
-                # data = data.unsqueeze(1)              # 3DConv时执行
 
             indices = [b[1:] for b in batch]
             data = data.to(device)
@@ -366,9 +342,7 @@ def test(net, img, hyperparams):
                 output = np.transpose(output.numpy(), (0, 2, 3, 1))
             for (x, y, w, h), out in zip(indices, output):
                 if center_pixel:
-                    # probs[x, y] += out
                     probs[x + w // 2, y + h // 2] += out
-                    # probs[x:x + w, y:y + h] += out
                 else:
                     probs[x:x + w, y:y + h] += out
     return probs
